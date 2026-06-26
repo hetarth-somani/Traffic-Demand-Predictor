@@ -1,0 +1,459 @@
+================================================================================
+         FLIPKART GRIDLOCK HACKATHON — TECHNICAL APPROACH REPORT
+              Traffic Demand Prediction | Regression Challenge
+================================================================================
+
+AUTHORS      : EKLAVYA
+COMPETITION  : Flipkart Gridlock Hackathon 2.0 
+TASK         : 15-minute interval traffic demand forecasting (regression)
+BEST LB SCORE: ~90.30023 (max(0, 100 × R²))
+DATE         : June 2025
+
+
+TABLE OF CONTENTS
+
+  1. Problem Statement
+  2. Dataset Description & Exploratory Data Analysis (EDA)
+  3. Feature Engineering
+  4. Modelling Architecture
+  5. Validation Strategy
+  6. Tools, Packages & Environment
+  7. What We Tried & Rejected
+  8. Results & Leaderboard Performance
+  9. Lessons Learned & Future Directions
+
+
+
+1. PROBLEM STATEMENT
+════════════════════
+
+Objective:
+  Predict continuous traffic demand at 15-minute granularity across multiple
+  geographic locations (geohash-encoded cells).
+
+Evaluation Metric:
+  score = max(0,  100 × R²(y_actual, y_predicted))
+  — Computed on the original (non-transformed) demand scale.
+  — R² below 0 is clipped to 0; perfect prediction → 100.
+
+Train Size : 77,299 rows, 11 columns (includes target `demand`)
+Test Size  : 41,778 rows, 10 columns (no target)
+
+The challenge is fundamentally a time-series forecasting problem where:
+  • Locations are encoded as geohash strings (high cardinality, ~400+ cells).
+  • The data covers an extremely short window (~26 hours total).
+  • Test set requires predictions 2–13.75 hours ahead of the last training point.
+
+
+
+
+
+2. DATASET DESCRIPTION & EXPLORATORY DATA ANALYSIS (EDA)
+══════════════════════════════════════════════════════════
+
+2.1 Raw Column Overview
+────────────────────────
+  Column              Type         Notes
+  ──────────────────────────────────────────────────────────────────────────
+  geohash6            string       Location identifier (~400+ unique cells)
+  day                 integer      Day index; train = {48, 49}, test ⊂ {49}
+  timestamp           string       Time-of-day only (format: "H:MM", e.g. "0:15")
+  Temperature         float        Ambient temperature reading
+  NumberofLanes       integer      Road capacity proxy
+  [road_type cols]    categorical  One-hot / label-encoded road attributes
+  [weather cols]      categorical  Weather condition indicators
+  demand              float        TARGET — 15-min traffic demand volume
+
+2.2 Critical Time Structure Discovery
+───────────────────────────────────────
+  The single most important EDA finding:
+
+    • `timestamp` is NOT a full datetime — it is only a time-of-day string
+      (e.g., "6:30" means 6:30 AM on whatever day is in the `day` column).
+
+    • Data spans approximately 26 hours:
+        Train : day 48 (full 24 h, 96 slots) + first 2 h of day 49 (8 slots)
+        Test  : day 49 from 02:15 to 13:45  → 47 × 15-min slots
+
+    • True timestamp was reconstructed as:
+        _ts = base_datetime + (day - 48) × 24h + parsed_time_of_day
+        slot = (day - 48) × 96 + (hour × 60 + minute) / 15
+
+    • This reconstruction was essential for correct lag semantics.
+      Without it, "lag-96" (one day back) was computed incorrectly.
+
+2.3 Demand Distribution
+────────────────────────
+  • Demand is right-skewed with high-demand spikes at certain geohash cells.
+  • Clear 15-minute periodicity within each day (morning ramp, mid-day plateau,
+    evening peak, overnight trough).
+  • Day 49 morning (02:15–13:45) captures the ramp-up from overnight low to
+    near-peak hours — the hardest window to predict iteratively.
+
+2.4 Geohash Analysis
+─────────────────────
+  • ~400+ unique geohash cells of varying demand levels.
+  • High-volume geohashes (highways, junctions) exhibit sharp morning spikes.
+  • Low-volume geohashes remain nearly flat — easy to predict, contribute little
+    to the overall R² signal.
+  • Target encoding per geohash (fold-aware) was the single most impactful
+    feature beyond lags.
+
+2.5 Temporal Patterns
+──────────────────────
+  • Demand auto-correlation is strongest at lag-1 (15 min back) and lag-4 (1 h).
+  • Day-over-day patterns (lag-96) are meaningful but we have only one full day
+    of prior data, so lag-96 == lag across the single day boundary.
+  • Rolling statistics over 3–6 slots capture short bursts; over 12–24 slots
+    capture trend level.
+
+
+
+
+
+3. FEATURE ENGINEERING
+═══════════════════════
+
+All lag and rolling features were computed STRICTLY within each training fold
+to prevent data leakage. Validation and test predictions were generated using
+an iterative one-step-ahead loop (see §4.2).
+
+3.1 Temporal Features
+──────────────────────
+  Feature                 Description
+  ──────────────────────────────────────────────────────────────────────────
+  hour                    Integer hour of day (0–23)
+  minute                  Minute within hour (0, 15, 30, 45)
+  slot_of_day             Slot index 0–95 within a 24-h day
+  slot_global             Global slot index across all days
+  hour_sin / hour_cos     Sine/cosine encoding of hour (captures cyclicality)
+  slot_sin / slot_cos     Sine/cosine encoding of slot_of_day
+  is_peak_morning         Binary flag: slot in typical morning peak range
+  is_overnight            Binary flag: slot in overnight low-demand range
+
+3.2 Lag Features (per geohash)
+───────────────────────────────
+  lag_1                   Demand 15 min ago (same geohash)
+  lag_2                   Demand 30 min ago
+  lag_4                   Demand 1 hour ago
+  lag_8                   Demand 2 hours ago
+  lag_12                  Demand 3 hours ago
+  lag_24                  Demand 6 hours ago
+  lag_48                  Demand 12 hours ago
+  lag_96                  Demand 24 hours ago (one full day back)
+
+  ⚠ LEAKAGE CONTROL: Lags are always built from past rows only within each
+  fold's training window. The iterative inference loop (§4.2) feeds model
+  predictions back as lag inputs for subsequent slots.
+
+3.3 Rolling Statistics (per geohash)
+──────────────────────────────────────
+  roll_mean_3             Rolling mean over last 3 slots (45 min)
+  roll_mean_6             Rolling mean over last 6 slots (90 min)
+  roll_mean_12            Rolling mean over last 12 slots (3 hours)
+  roll_std_3              Rolling std over last 3 slots (volatility)
+  roll_std_6              Rolling std over last 6 slots
+  roll_max_12             Rolling max over last 12 slots
+  roll_min_12             Rolling min over last 12 slots
+  roll_trend_6            Linear trend slope over last 6 slots (rise/fall rate)
+
+3.4 Geohash Encoding
+─────────────────────
+  geohash_target_enc      Smoothed mean-target encoding of geohash, re-fitted
+                          on training portion of each fold to prevent leakage.
+                          Smoothing factor = 10 (count-weighted blend with
+                          global mean).
+
+  geohash_std_enc         Smoothed std-of-target encoding (demand volatility
+                          per location — helps model distinguish stable vs.
+                          volatile cells).
+
+3.5 Static Features (passed as-is)
+────────────────────────────────────
+  Temperature, NumberofLanes, and all road/weather categorical columns.
+  Categoricals were label-encoded once globally (consistent across folds).
+
+3.6 Calibration Feature
+────────────────────────
+  After iterative prediction on the validation set, a median ratio was computed:
+    calibration_factor = median(y_val_actual) / median(y_val_predicted)
+  This scalar factor was multiplied into all test predictions (+0.05 LB gain).
+
+
+
+
+
+4. MODELLING ARCHITECTURE
+══════════════════════════
+
+4.1 Primary Model: LightGBM (Gradient Boosted Trees)
+──────────────────────────────────────────────────────
+  We chose LightGBM as our primary learner for the following reasons:
+    • Handles high-cardinality categoricals efficiently.
+    • Fast training — critical for iterative fold-aware pipelines.
+    • Strong performance on tabular time-series with lag features.
+    • Native support for sample weights (used for recency weighting).
+
+  Final Hyperparameters (post-Optuna tuning):
+  ─────────────────────────────────────────────
+    num_leaves         : 127
+    learning_rate      : 0.03
+    n_estimators       : 1200
+    min_child_samples  : 20
+    subsample          : 0.85
+    colsample_bytree   : 0.80
+    reg_alpha          : 0.1
+    reg_lambda         : 1.0
+    objective          : regression
+    metric             : rmse
+    verbose            : -1
+
+4.2 Iterative One-Step-Ahead Forecasting
+─────────────────────────────────────────
+  This was the CORE innovation that fixed the CV–LB gap:
+
+  Standard approach (broken):
+    Compute all lag features upfront using the full dataset.
+    → Lag features in the test set reference future values that don't exist.
+    → Constant proxies (last training value) become stale over long horizons.
+
+  Our iterative approach (correct):
+    for each time slot t in {val/test slots} in chronological order:
+      1. Build row for slot t using only predictions from slots < t.
+      2. Predict demand at slot t → ŷ_t
+      3. Insert ŷ_t into the lag buffer.
+      4. Next slot's lag_1 = ŷ_t, lag_2 = ŷ_{t-1}, etc.
+
+  This exactly mirrors how predictions would be used in real deployment and
+  ensures that the validation score correlates with the leaderboard score.
+
+4.3 Bagging Ensemble (10-Seed)
+───────────────────────────────
+  To reduce variance in the iterative loop:
+    • Trained 10 identical LightGBM models with different random seeds.
+    • During inference, ran the iterative loop independently for each seed.
+    • Final prediction = mean of all 10 iterative prediction sequences.
+  
+  Rationale: Each seed produces slightly different lag-propagation trajectories;
+  averaging smooths out prediction instability without changing model structure.
+
+4.4 Hyperparameter Tuning: Optuna
+───────────────────────────────────
+  Framework : Optuna (TPE sampler, 100 trials)
+  CV setup  : 3-fold expanding-window on day 48 only
+              (each fold: train N slots → iteratively predict next 16 slots)
+  Objective : Maximise mean iterative R² across 3 folds
+
+  Key finding: Optuna-tuned parameters improved the 2-hour day-split CV
+  from 91.68 → 91.84 but did NOT push the LB past 89.9, confirming that
+  short-horizon tuning does not generalise to the full 47-slot test horizon.
+
+
+
+5. VALIDATION STRATEGY
+═══════════════════════
+
+5.1 Day-Split Validation (Primary)
+────────────────────────────────────
+  Train  : All of day 48 (96 slots, 77,299 rows minus day 49 rows)
+  Validate: Day 49 first 2 hours (8 slots, ~3,200 rows)
+  Method : Iterative one-step-ahead inference on the 8 validation slots.
+  Score  : 91.84 R²
+
+  Why: Most realistic split available. Directly mirrors the train→test boundary.
+  Limitation: Only 8 steps — significantly shorter than the 47-step test horizon.
+
+5.2 Slot-Based 5-Fold CV (Secondary)
+──────────────────────────────────────
+  Folds defined by time slot boundaries (not row index).
+  Each fold validates ~20 consecutive slots using iterative inference.
+  Mean CV : 80.52 ± 15.64
+
+  High variance arises because some folds validate over demand cliff edges
+  (e.g., late-night drop-off) while the test is a morning ramp-up only.
+
+5.3 Long-Horizon CV (Proposed Final Fix)
+─────────────────────────────────────────
+  Train on first 60 slots of day 48 → iteratively predict last 36 slots.
+  36 slots ≈ 9 hours, closer to the 11.5-hour test horizon.
+  This score correlates better with LB and should guide all future decisions.
+
+5.4 Anti-Leakage Measures
+──────────────────────────
+  ✓ Lag features rebuilt inside every fold training window.
+  ✓ Target encoding re-fitted per fold on training portion only.
+  ✓ Validation/test lags populated iteratively from model predictions.
+  ✓ Calibration factor derived from validation fold, not from test.
+  ✗ Global lag precomputation (tried, rejected — inflated CV by ~5 points).
+
+
+
+6. TOOLS, PACKAGES & ENVIRONMENT
+══════════════════════════════════
+
+6.1 Language & Runtime
+───────────────────────
+  Language  : Python 3.10+
+  Runtime   : Jupyter Notebook / Google Colab (GPU runtime not required)
+
+6.2 Core Libraries
+───────────────────
+  Package              Version    Purpose
+  ────────────────────────────────────────────────────────────────────────
+  lightgbm             ≥ 4.0      Primary gradient-boosted tree model
+  optuna               ≥ 3.0      Hyperparameter optimisation (TPE sampler)
+  pandas               ≥ 2.0      Data manipulation, time-series operations
+  numpy                ≥ 1.24     Numerical operations, array handling
+  scikit-learn         ≥ 1.3      R² metric, label encoding, train/test split
+  matplotlib           ≥ 3.7      EDA plots, demand time-series visualisation
+  seaborn              ≥ 0.12     Correlation heatmaps, distribution plots
+
+6.3 Supporting Libraries
+─────────────────────────
+  Package              Purpose
+  ────────────────────────────────────────────────────────────────────────
+  tqdm                 Progress bars for iterative inference loops
+  joblib               Parallel model training across seeds
+  warnings             Suppressing LightGBM verbosity during tuning
+  datetime / timedelta Timestamp reconstruction from day + time-of-day
+
+6.4 Evaluation
+───────────────
+  sklearn.metrics.r2_score  — R² computation
+  Custom wrapper            — max(0, 100 * r2_score(...)) for competition metric
+
+6.5 Submission Pipeline
+────────────────────────
+  1. Train 10 LightGBM models on full training data (day 48 + day 49 partial).
+  2. Sort test rows by geohash and global slot.
+  3. Run iterative inference loop slot-by-slot for each model.
+  4. Average predictions across 10 seeds.
+  5. Apply median-ratio calibration factor.
+  6. Export CSV with columns [id, demand].
+
+
+
+7. WHAT WE TRIED & REJECTED
+═════════════════════════════
+
+  Approach                        Why Rejected / What Failed
+  ────────────────────────────────────────────────────────────────────────────
+  Global lag precomputation       Leaked future data into CV; R² inflated by
+  before cross-validation         ~5 pts; CV-LB gap collapsed model trust.
+
+  Row-based TimeSeriesSplit       Ignored uneven sample density; one fold had
+                                  a 7-hour gap → R² of 0.53 in that fold.
+                                  Replaced by slot-based splits.
+
+  No-lag model (static features   Without lags, model cannot learn demand
+  only)                           dynamics. R² dropped to ~82. Lags are
+                                  non-negotiable with only 1 day of history.
+
+  Constant lag proxies for test   Last-training-value proxies go stale over
+  (non-iterative)                 the 11.5-hour test horizon. Fixed by full
+                                  iterative inference loop.
+
+  LightGBM + CatBoost stacking    CatBoost underperformed LightGBM alone.
+  with meta-learner               OOF set too small → meta-model overfit.
+                                  Net LB impact was negative.
+
+  Trend-adjusted proxy methods    Hand-crafted trend increments introduced
+                                  arbitrary assumptions; iterative loop is
+                                  strictly more principled.
+
+  XGBoost as drop-in replacement  Requires full re-engineering of iterative
+                                  loop. Not trialled due to time constraints.
+
+  LSTM / sequence models          Only 96 time steps per geohash (1 day).
+                                  Too few samples for LSTM generalisation;
+                                  risk of overfitting the single day pattern.
+
+  Log-transform of demand         Minimal R² improvement; adds complexity in
+                                  back-transformation and calibration.
+
+  Winsorizing outliers            Clipping high-demand geohash spikes reduced
+                                  model's ability to capture peak hours.
+
+  Optuna tuning on leaky CV       Best parameters from leaky pipeline were
+                                  meaningless; tuning restarted from scratch
+                                  after fixing the CV pipeline.
+
+
+________________________________________________________________________________
+
+
+8. RESULTS & LEADERBOARD PERFORMANCE
+═══════════════════════════════════════
+
+  Experiment                               Day-Split CV    Public LB
+  ────────────────────────────────────────────────────────────────────
+  Baseline LightGBM (no lags, leaky CV)    ~88.0           ~85.0
+  + Lags + Optuna (leaky CV)               ~90.5           ~86.0
+  Model C: Iterative + fold-aware lags     91.68           89.9
+  + Median-ratio calibration               91.68           ~90.0 (est.)
+  + Optuna on iterative CV                 91.84           89.9
+  + 10-seed bagging                        91.84           89.9  ← BEST
+
+  Key Gap Analysis:
+  • Day-split CV (8 steps):  91.84  → short-horizon, optimistic
+  • Slot-based CV (20 steps): 80.52 → high variance, not reliable
+  • Public LB (47 steps):    89.9   → true long-horizon performance
+  • Iterative CV day48 (16 slots): ~79.5 → closer proxy for LB behaviour
+
+  The gap between day-split (91.84) and LB (89.9) is caused by error
+  accumulation in the iterative loop over 47 steps. The model was implicitly
+  optimised for 8-step horizons; 47-step performance degrades due to
+  compounding lag-prediction errors.
+
+
+
+
+9. LESSONS LEARNED & FUTURE DIRECTIONS
+═══════════════════════════════════════
+
+9.1 Core Lessons
+─────────────────
+  1. Fix evaluation first, tune second.
+     The moment our CV pipeline was leaky, every tuning decision was
+     meaningless. Three days of Optuna tuning on a leaky setup taught us
+     nothing. The honest iterative CV was the foundation for everything.
+
+  2. Validation horizon must match test horizon.
+     A 2-hour validation window does not predict behaviour on a 11.5-hour
+     test window. Always create at least one validation fold whose length
+     equals the test length.
+
+  3. Iterative inference is mandatory for multi-step lag models.
+     Any model that uses its own past predictions as future lag inputs must
+     be evaluated iteratively, not with constant proxies.
+
+  4. Data volume constraints are real.
+     With only 26 hours of data, complex architectures (LSTM, stacking)
+     are high-risk. Simple, interpretable models with strong lag features
+     win on tiny temporal datasets.
+
+9.2 Future Directions (to push past 90.0)
+───────────────────────────────────────────
+  Priority 1 — Long-horizon validation (36-slot CV on day48)
+    Use this as the primary metric for all future decisions. It correlates
+    far better with the LB than the current 8-slot day-split.
+
+  Priority 2 — Error accumulation analysis
+    Simulate the iterative loop on day48 and plot R² vs forecast horizon
+    (1-step, 2-step, …, 36-step). Identify where the model systematically
+    under- or over-predicts and design a correction.
+
+  Priority 3 — Sample weighting (recency bias)
+    Weight training rows by exponential decay (more recent rows weighted
+    higher). This biases the model toward accuracy at the start of the
+    test period, reducing initial lag errors that compound downstream.
+
+  Priority 4 — Trend-aware lag buffer inside iterative loop
+    Estimate the average demand rise rate per geohash during morning hours
+    from training data. Add a small dynamic increment to lag values as the
+    loop progresses to prevent lag features from systematically lagging
+    behind a rising demand trend.
+
+  Priority 5 — XGBoost parallel ensemble
+    Train XGBoost with the same iterative pipeline. Take a fixed weighted
+    average (no meta-learner) of LightGBM + XGBoost predictions.
